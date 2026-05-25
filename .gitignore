@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Local data / artifacts
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+report*.md
+bedrock_traceability_summary.md
+
+# Local run scripts (may contain account IDs / bucket names)
+run.sh
