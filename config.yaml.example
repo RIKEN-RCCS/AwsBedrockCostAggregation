@@ -1,0 +1,21 @@
+# Bedrock 日次コストアラート設定テンプレート
+# このファイルをコピーして config.yaml を作成してください。
+#   cp config.yaml.example config.yaml
+#
+# Slack Bot Token は YAML ではなく env SLACK_BOT_TOKEN で渡します。
+#   推奨: ~/.secrets/slack_tokens.sh (chmod 600) に export を記載
+
+# ===== 必須 =====
+bucket: bedrock-invocation-logs-xxxxxxxxxxxx-us-east-1-an
+region: us-east-1
+db_path: ./bedrock_logs.db
+daily_threshold_usd: 5.0          # 1 ユーザー当たりの日次しきい値 (USD)
+
+slack:
+  channel_id: C0123456789         # 通知先 Slack チャンネル ID
+  # username: Bedrock Cost Bot    # 任意: 投稿時の表示名
+  # icon_emoji: ":money_with_wings:"  # 任意: 投稿時のアイコン
+
+# ===== 任意 =====
+# usd_to_jpy: 155.0                # 指定時はメッセージに JPY も併記
+# resolve_owner: true              # IAM タグからの所有者解決 (既定 true)

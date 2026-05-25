@@ -179,6 +179,18 @@ def init_db(db_path: Path) -> sqlite3.Connection:
             ON invocations(year, month);
         CREATE INDEX IF NOT EXISTS idx_invocations_key
             ON invocations(key);
+        CREATE INDEX IF NOT EXISTS idx_invocations_timestamp
+            ON invocations(timestamp);
+
+        CREATE TABLE IF NOT EXISTS notified_alerts (
+            date           TEXT NOT NULL,
+            identity_arn   TEXT NOT NULL,
+            username       TEXT,
+            daily_cost_usd REAL NOT NULL,
+            threshold_usd  REAL NOT NULL,
+            notified_at    TEXT NOT NULL,
+            PRIMARY KEY (date, identity_arn)
+        );
         """
     )
     conn.commit()
