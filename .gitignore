@@ -16,3 +16,6 @@ run.sh
 
 # Local config (may contain channel IDs / bucket names)
 config.yaml
+
+# Daily alert log files
+logs/

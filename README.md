@@ -132,10 +132,18 @@ export SLACK_BOT_TOKEN="xoxb-XXXXXXXXXXXX-XXXXXXXXXXXX-XXXXXXXXXXXXXXXXXXXXXXXX"
 ### cron 例
 
 ```cron
-5 * * * * /path/to/AwsBedrockCostAggregation/run_daily_alert.sh >> /tmp/bedrock_daily_alert.log 2>&1
+5 * * * * /path/to/AwsBedrockCostAggregation/run_daily_alert.sh
 ```
 
 `run_daily_alert.sh` が `~/.secrets/slack_tokens.sh` を source して `SLACK_BOT_TOKEN` を export するため、cron の環境にトークンを直書きする必要はない。
+
+### ログ
+
+`run_daily_alert.sh` は実行ごとの stdout/stderr を **JST 日付付きファイル** に追記する。
+
+- 出力先: `logs/daily_alert-YYYY-MM-DD.log` (スクリプトと同階層、自動作成)
+- 各起動の冒頭に `===== <JST タイムスタンプ> =====`、末尾に `----- exit=<code> -----` を記録
+- ローテーションは行わない（無限 append）。長期運用で肥大化が気になる場合は手動・cron 等で古い `daily_alert-*.log` を削除する
 
 ### 主なオプション
 
