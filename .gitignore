@@ -13,7 +13,6 @@ bedrock_traceability_summary.md
 
 # Local run scripts (may contain account IDs / bucket names)
 run.sh
-run_daily_alert.sh
 
 # Local config (may contain channel IDs / bucket names)
 config.yaml
