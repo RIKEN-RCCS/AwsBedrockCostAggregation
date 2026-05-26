@@ -9,7 +9,12 @@
 bucket: bedrock-invocation-logs-xxxxxxxxxxxx-us-east-1-an
 region: us-east-1
 db_path: ./bedrock_logs.db
-daily_threshold_usd: 5.0          # 1 ユーザー当たりの日次しきい値 (USD)
+# 1 ユーザー当たりの日次しきい値 (USD)。各段階を超えたタイミングで個別に Slack 通知。
+# 段階ごとに dedup されるため、$10 → $100 → $1000 と上昇すれば最大 3 通通知される。
+daily_threshold_tiers_usd:
+  - 10.0
+  - 100.0
+  - 1000.0
 
 slack:
   channel_id: C0123456789         # 通知先 Slack チャンネル ID

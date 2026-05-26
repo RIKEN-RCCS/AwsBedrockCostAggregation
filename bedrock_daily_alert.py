@@ -2,8 +2,9 @@
 """
 Bedrock 日次コストアラート (Slack 通知)
 
-JST 当日のユーザー別コストをしきい値判定し、超過ユーザーを Slack に通知する。
-毎時 cron 起動を想定し、同一 (date, identity_arn) には 1 日 1 通までに抑制する。
+JST 当日のユーザー別コストを段階しきい値で判定し、超過した段階ごとに Slack に通知する。
+毎時 cron 起動を想定し、同一 (date, identity_arn, tier) には 1 日 1 通までに抑制する。
+($10, $100, $1000 と段階を上昇すれば 1 日に最大 3 通通知される)
 
 設定は config.yaml に集中管理。Slack Bot Token は env SLACK_BOT_TOKEN で渡す。
 
@@ -47,10 +48,12 @@ def load_config(path: Path) -> dict:
     with open(path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
 
-    required_top = ["bucket", "region", "db_path", "daily_threshold_usd"]
+    required_top = ["bucket", "region", "db_path"]
     missing = [k for k in required_top if k not in cfg]
     if "slack" not in cfg or "channel_id" not in (cfg.get("slack") or {}):
         missing.append("slack.channel_id")
+    if "daily_threshold_tiers_usd" not in cfg and "daily_threshold_usd" not in cfg:
+        missing.append("daily_threshold_tiers_usd")
     if missing:
         sys.exit(f"❌ config missing required keys: {missing}")
 
@@ -58,6 +61,37 @@ def load_config(path: Path) -> dict:
         sys.exit("❌ env SLACK_BOT_TOKEN is required")
 
     return cfg
+
+
+# ============================================================
+# 段階別しきい値
+# ============================================================
+# tier 1 = :warning: 注意, tier 2 = :rotating_light: 警戒, tier 3 = :fire: 重大
+TIER_STYLES: dict[int, dict[str, str]] = {
+    1: {"emoji": ":warning:", "label": "注意"},
+    2: {"emoji": ":rotating_light:", "label": "警戒"},
+    3: {"emoji": ":fire:", "label": "重大"},
+}
+
+
+def load_thresholds(cfg: dict) -> list[float]:
+    """config から段階しきい値を昇順 list で取得。後方互換のため旧キーも許容。"""
+    tiers = cfg.get("daily_threshold_tiers_usd")
+    if tiers is None:
+        tiers = [cfg["daily_threshold_usd"]]
+    if not isinstance(tiers, list) or not tiers:
+        sys.exit("❌ daily_threshold_tiers_usd must be a non-empty list")
+    try:
+        vals = sorted(float(x) for x in tiers)
+    except (TypeError, ValueError):
+        sys.exit(f"❌ daily_threshold_tiers_usd must be numeric: {tiers}")
+    if any(v <= 0 for v in vals):
+        sys.exit(f"❌ daily_threshold_tiers_usd must be positive: {vals}")
+    return vals
+
+
+def tier_style(tier: int) -> dict[str, str]:
+    return TIER_STYLES.get(tier, {"emoji": ":warning:", "label": f"tier{tier}"})
 
 
 # ============================================================
@@ -175,25 +209,26 @@ def load_daily_stats(conn: sqlite3.Connection, jst_date: date,
 # ============================================================
 # 通知履歴
 # ============================================================
-def already_notified(conn: sqlite3.Connection, date_str: str, identity_arn: str) -> bool:
+def already_notified(conn: sqlite3.Connection, date_str: str,
+                      identity_arn: str, tier: int) -> bool:
     cur = conn.execute(
-        "SELECT 1 FROM notified_alerts WHERE date = ? AND identity_arn = ?",
-        (date_str, identity_arn),
+        "SELECT 1 FROM notified_alerts WHERE date = ? AND identity_arn = ? AND tier = ?",
+        (date_str, identity_arn, tier),
     )
     return cur.fetchone() is not None
 
 
 def record_notification(conn: sqlite3.Connection, date_str: str,
-                         identity_arn: str, username: str,
+                         identity_arn: str, tier: int, username: str,
                          daily_cost_usd: Decimal, threshold_usd: float) -> None:
     conn.execute(
         """
         INSERT OR IGNORE INTO notified_alerts
-            (date, identity_arn, username, daily_cost_usd, threshold_usd, notified_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+            (date, identity_arn, tier, username, daily_cost_usd, threshold_usd, notified_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            date_str, identity_arn, username,
+            date_str, identity_arn, tier, username,
             float(daily_cost_usd), float(threshold_usd),
             datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         ),
@@ -209,13 +244,16 @@ def _short_model(model_id: str) -> str:
 
 
 def format_slack_message(user_row: dict, threshold: float, jst_date: date,
-                          usd_to_jpy: float | None) -> tuple[str, list[dict]]:
+                          usd_to_jpy: float | None,
+                          tier: int, tier_count: int) -> tuple[str, list[dict]]:
     total = user_row["total_usd"]
     username = user_row["username"] or "unknown"
+    style = tier_style(tier)
 
     # ヘッダー (mrkdwn: 太字は *bold*)
     header_lines = [
-        f"*:warning: Bedrock 日次コスト超過 ({jst_date.isoformat()})*",
+        f"*{style['emoji']} Bedrock 日次コスト超過 "
+        f"[Tier {tier}/{tier_count} {style['label']}] ({jst_date.isoformat()})*",
         f"ユーザー: *{username}*",
         f"本日コスト: *${total:.2f} USD*  (閾値: ${threshold:.2f})",
     ]
@@ -257,8 +295,8 @@ def format_slack_message(user_row: dict, threshold: float, jst_date: date,
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": buf}})
 
     fallback = (
-        f"Bedrock 日次コスト超過 {jst_date.isoformat()}: "
-        f"{username} ${total:.2f} (閾値 ${threshold:.2f})"
+        f"Bedrock 日次コスト超過 [Tier {tier}/{tier_count} {style['label']}] "
+        f"{jst_date.isoformat()}: {username} ${total:.2f} (閾値 ${threshold:.2f})"
     )
     return fallback, blocks
 
@@ -296,14 +334,15 @@ def main() -> int:
     cfg = load_config(cfg_path)
 
     jst_d = parse_jst_date(args.date) if args.date else jst_today()
-    threshold = float(cfg["daily_threshold_usd"])
+    thresholds = load_thresholds(cfg)
 
     db_path = Path(cfg["db_path"])
     if not db_path.is_absolute():
         db_path = (cfg_path.parent / db_path).resolve()
 
+    tier_desc = ", ".join(f"T{i+1}=${t:.2f}" for i, t in enumerate(thresholds))
     print(f"🗄️  DB: {db_path}", file=sys.stderr)
-    print(f"📅 対象日 (JST): {jst_d}  しきい値: ${threshold:.2f}", file=sys.stderr)
+    print(f"📅 対象日 (JST): {jst_d}  段階しきい値: {tier_desc}", file=sys.stderr)
 
     conn = init_db(db_path)
     try:
@@ -320,49 +359,71 @@ def main() -> int:
                 print(f"⚠️  所有者解決をスキップ: {e}", file=sys.stderr)
 
         rows = load_daily_stats(conn, jst_d, owner_map)
-        over = [r for r in rows if r["total_usd"] >= Decimal(str(threshold))]
 
         date_str = jst_d.isoformat()
         client = WebClient(token=os.environ["SLACK_BOT_TOKEN"])
         sent = 0
         skipped_dedup = 0
+        over_users = 0
+        tier_count = len(thresholds)
 
-        for r in over:
+        # ユーザー × 段階で個別判定。低い段階から順に投稿することで時系列の読みやすさを保つ。
+        for r in rows:
             arn = r["identity_arn"] or ""
-            if not args.force_notify and already_notified(conn, date_str, arn):
-                skipped_dedup += 1
-                continue
+            user_over = False
+            for idx, threshold in enumerate(thresholds):
+                tier = idx + 1
+                if r["total_usd"] < Decimal(str(threshold)):
+                    break  # 昇順なのでこれ以上の段階も未達
+                user_over = True
 
-            fallback, blocks = format_slack_message(
-                r, threshold, jst_d, cfg.get("usd_to_jpy"),
-            )
+                if not args.force_notify and already_notified(conn, date_str, arn, tier):
+                    skipped_dedup += 1
+                    continue
 
-            if args.dry_run:
-                print(f"--- DRY-RUN ALERT: {r['username']} (${r['total_usd']:.2f}) ---",
-                      file=sys.stderr)
-                print(fallback, file=sys.stderr)
-                print(f"  blocks={len(blocks)} text_chars={sum(len(b['text']['text']) for b in blocks)}",
-                      file=sys.stderr)
-                continue
-
-            try:
-                post_slack(
-                    client, cfg["slack"]["channel_id"],
-                    fallback, blocks,
-                    cfg["slack"].get("username"),
-                    cfg["slack"].get("icon_emoji"),
+                fallback, blocks = format_slack_message(
+                    r, threshold, jst_d, cfg.get("usd_to_jpy"),
+                    tier, tier_count,
                 )
-            except SlackApiError as e:
-                print(f"❌ Slack API error for {r['username']}: {e.response['error']}",
-                      file=sys.stderr)
-                raise
 
-            record_notification(conn, date_str, arn, r["username"],
-                                r["total_usd"], threshold)
-            sent += 1
+                if args.dry_run:
+                    print(
+                        f"--- DRY-RUN ALERT[T{tier}/{tier_count}]: "
+                        f"{r['username']} (${r['total_usd']:.2f} >= ${threshold:.2f}) ---",
+                        file=sys.stderr,
+                    )
+                    print(fallback, file=sys.stderr)
+                    print(
+                        f"  blocks={len(blocks)} "
+                        f"text_chars={sum(len(b['text']['text']) for b in blocks)}",
+                        file=sys.stderr,
+                    )
+                    continue
+
+                try:
+                    post_slack(
+                        client, cfg["slack"]["channel_id"],
+                        fallback, blocks,
+                        cfg["slack"].get("username"),
+                        cfg["slack"].get("icon_emoji"),
+                    )
+                except SlackApiError as e:
+                    print(
+                        f"❌ Slack API error for {r['username']} (tier {tier}): "
+                        f"{e.response['error']}",
+                        file=sys.stderr,
+                    )
+                    raise
+
+                record_notification(conn, date_str, arn, tier, r["username"],
+                                    r["total_usd"], threshold)
+                sent += 1
+
+            if user_over:
+                over_users += 1
 
         print(
-            f"✅ checked={len(rows)} over={len(over)} "
+            f"✅ checked={len(rows)} over_users={over_users} "
             f"notified={sent} skipped_dedup={skipped_dedup}"
             f"{' [dry-run]' if args.dry_run else ''}",
             file=sys.stderr,

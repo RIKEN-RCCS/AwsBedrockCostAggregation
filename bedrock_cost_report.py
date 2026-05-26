@@ -185,16 +185,49 @@ def init_db(db_path: Path) -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS notified_alerts (
             date           TEXT NOT NULL,
             identity_arn   TEXT NOT NULL,
+            tier           INTEGER NOT NULL DEFAULT 0,
             username       TEXT,
             daily_cost_usd REAL NOT NULL,
             threshold_usd  REAL NOT NULL,
             notified_at    TEXT NOT NULL,
-            PRIMARY KEY (date, identity_arn)
+            PRIMARY KEY (date, identity_arn, tier)
         );
         """
     )
+    _migrate_notified_alerts_tier(conn)
     conn.commit()
     return conn
+
+
+def _migrate_notified_alerts_tier(conn: sqlite3.Connection) -> None:
+    """旧スキーマ ((date, identity_arn) PK, tier 列なし) を tier 付きへ移行。
+
+    旧データは tier=1 として登録する。旧通知が新しい上位 tier 超過の妨げにならないよう
+    最下位段階のみへ移すことで、$1 → $10 → $30 のような閾値見直し後でも上位通知が出る。
+    """
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(notified_alerts)")]
+    if "tier" in cols:
+        return
+    conn.executescript(
+        """
+        ALTER TABLE notified_alerts RENAME TO notified_alerts_old;
+        CREATE TABLE notified_alerts (
+            date           TEXT NOT NULL,
+            identity_arn   TEXT NOT NULL,
+            tier           INTEGER NOT NULL DEFAULT 0,
+            username       TEXT,
+            daily_cost_usd REAL NOT NULL,
+            threshold_usd  REAL NOT NULL,
+            notified_at    TEXT NOT NULL,
+            PRIMARY KEY (date, identity_arn, tier)
+        );
+        INSERT INTO notified_alerts
+            (date, identity_arn, tier, username, daily_cost_usd, threshold_usd, notified_at)
+            SELECT date, identity_arn, 1, username, daily_cost_usd, threshold_usd, notified_at
+              FROM notified_alerts_old;
+        DROP TABLE notified_alerts_old;
+        """
+    )
 
 
 def _classify_cache_control(cc: dict) -> str:

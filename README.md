@@ -75,7 +75,7 @@ S3 に出力された AWS Bedrock の Model Invocation Logs を集計し、**JST
 | `bucket` | ✅ | Bedrock invocation log の出力先 S3 バケット名 |
 | `region` | ✅ | バケット内ログのリージョン (例: `us-east-1`) |
 | `db_path` | ✅ | SQLite DB のパス（相対指定時は config からの相対） |
-| `daily_threshold_usd` | ✅ | 1 ユーザーあたりの日次しきい値 (USD)。これを超えると通知 |
+| `daily_threshold_tiers_usd` | ✅ | 1 ユーザーあたりの日次しきい値 (USD) を昇順 list で指定。例 `[10, 100, 1000]`。各段階を超えるたびに別通知（段階×日×ユーザーで dedup） |
 | `slack.channel_id` | ✅ | 通知先 Slack チャンネル ID（`C` で始まる ID） |
 | `slack.username` | ─ | 投稿時の表示名（任意） |
 | `slack.icon_emoji` | ─ | 投稿時のアイコン絵文字（任意、例: `:money_with_wings:`） |
@@ -91,7 +91,10 @@ S3 に出力された AWS Bedrock の Model Invocation Logs を集計し、**JST
 bucket: bedrock-invocation-logs-XXXXXXXXXXXX-us-east-1-XX
 region: us-east-1
 db_path: ./bedrock_logs.db
-daily_threshold_usd: 5.0
+daily_threshold_tiers_usd:
+  - 10.0    # Tier 1 (:warning: 注意)
+  - 100.0   # Tier 2 (:rotating_light: 警戒)
+  - 1000.0  # Tier 3 (:fire: 重大)
 
 slack:
   channel_id: CXXXXXXXXXX           # 通知先チャンネル ID
