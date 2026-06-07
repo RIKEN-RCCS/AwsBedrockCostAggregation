@@ -2,7 +2,7 @@
 """
 Bedrock 日次コストアラート (Slack 通知)
 
-JST 当日のユーザー別コストを段階しきい値で判定し、超過した段階ごとに Slack に通知する。
+指定日のユーザー別コストを段階しきい値で判定し、超過した段階ごとに Slack に通知する。
 毎時 cron 起動を想定し、同一 (date, identity_arn, tier) には 1 日 1 通までに抑制する。
 ($10, $100, $1000 と段階を上昇すれば 1 日に最大 3 通通知される)
 
@@ -18,24 +18,26 @@ import os
 import sqlite3
 import sys
 from collections import defaultdict
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
-import yaml
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
 from bedrock_cost_report import (
+    UNKNOWN_MODELS,
     calculate_cost,
+    date_to_utc_range,
     ingest_logs,
     init_db,
+    load_base_config,
+    months_to_ingest,
+    parse_tz,
 )
 from resolve_owner import build_owner_map, resolve_username
 
 
-JST = ZoneInfo("Asia/Tokyo")
 SLACK_SECTION_LIMIT = 2900  # Block Kit section の安全上限 (3000 字)
 
 
@@ -43,13 +45,9 @@ SLACK_SECTION_LIMIT = 2900  # Block Kit section の安全上限 (3000 字)
 # 設定読込
 # ============================================================
 def load_config(path: Path) -> dict:
-    if not path.exists():
-        sys.exit(f"❌ config not found: {path}")
-    with open(path, encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
+    cfg = load_base_config(path)
 
-    required_top = ["bucket", "region", "db_path"]
-    missing = [k for k in required_top if k not in cfg]
+    missing = []
     if "slack" not in cfg or "channel_id" not in (cfg.get("slack") or {}):
         missing.append("slack.channel_id")
     if "daily_threshold_tiers_usd" not in cfg and "daily_threshold_usd" not in cfg:
@@ -95,41 +93,12 @@ def tier_style(tier: int) -> dict[str, str]:
 
 
 # ============================================================
-# JST 日付 → UTC 範囲・対象月
-# ============================================================
-def jst_today() -> date:
-    return datetime.now(JST).date()
-
-
-def parse_jst_date(s: str) -> date:
-    return datetime.strptime(s, "%Y-%m-%d").date()
-
-
-def jst_date_to_utc_range(d: date) -> tuple[str, str]:
-    """JST [d 00:00, d+1 00:00) を ISO8601 UTC 文字列で返す (Z 終端)。"""
-    start_utc = datetime.combine(d, time(0, 0), tzinfo=JST).astimezone(timezone.utc)
-    end_utc = datetime.combine(d + timedelta(days=1), time(0, 0), tzinfo=JST).astimezone(timezone.utc)
-    fmt = "%Y-%m-%dT%H:%M:%SZ"
-    return start_utc.strftime(fmt), end_utc.strftime(fmt)
-
-
-def months_to_ingest(d: date) -> list[tuple[int, int]]:
-    """JST 当日を覆う UTC 範囲がまたぐ (year, month) のユニーク集合を返す。"""
-    start_str, end_str = jst_date_to_utc_range(d)
-    start_dt = datetime.strptime(start_str, "%Y-%m-%dT%H:%M:%SZ")
-    # end は半開区間なので 1 秒前を見る
-    end_dt = datetime.strptime(end_str, "%Y-%m-%dT%H:%M:%SZ") - timedelta(seconds=1)
-    months = {(start_dt.year, start_dt.month), (end_dt.year, end_dt.month)}
-    return sorted(months)
-
-
-# ============================================================
 # 日次集計
 # ============================================================
-def load_daily_stats(conn: sqlite3.Connection, jst_date: date,
+def load_daily_stats(conn: sqlite3.Connection, target_date: date, tz,
                      owner_map: dict | None) -> list[dict]:
-    """JST 当日のユーザー×モデル別 SUM を取得し、コスト計算してユーザー単位で集約。"""
-    start_utc, end_utc = jst_date_to_utc_range(jst_date)
+    """指定日 (tz) のユーザー×モデル別 SUM を取得し、コスト計算してユーザー単位で集約。"""
+    start_utc, end_utc = date_to_utc_range(target_date, tz)
 
     # ユーザー × モデル × cache_ttl_type で SUM
     cur = conn.execute(
@@ -180,15 +149,24 @@ def load_daily_stats(conn: sqlite3.Connection, jst_date: date,
             "total_calls": 0,
             "total_input": 0,
             "total_output": 0,
+            "total_cache_read": 0,
+            "total_cache_write_5min": 0,
+            "total_cache_write_1h": 0,
             "breakdown": [],
         })
         rec["total_usd"] += cost
         rec["total_calls"] += m["calls"]
         rec["total_input"] += m["input"]
         rec["total_output"] += m["output"]
+        rec["total_cache_read"] += m["cache_read"]
+        rec["total_cache_write_5min"] += m["cache_write_5min"]
+        rec["total_cache_write_1h"] += m["cache_write_1h"]
         rec["breakdown"].append({
             "model_id": model_id, "usd": cost, "calls": m["calls"],
             "input": m["input"], "output": m["output"],
+            "cache_read": m["cache_read"],
+            "cache_write_5min": m["cache_write_5min"],
+            "cache_write_1h": m["cache_write_1h"],
         })
 
     # display_name を解決
@@ -243,7 +221,7 @@ def _short_model(model_id: str) -> str:
     return (model_id or "").replace("anthropic.", "").replace("apac.anthropic.", "[apac]")
 
 
-def format_slack_message(user_row: dict, threshold: float, jst_date: date,
+def format_slack_message(user_row: dict, threshold: float, target_date: date,
                           usd_to_jpy: float | None,
                           tier: int, tier_count: int) -> tuple[str, list[dict]]:
     total = user_row["total_usd"]
@@ -253,7 +231,7 @@ def format_slack_message(user_row: dict, threshold: float, jst_date: date,
     # ヘッダー (mrkdwn: 太字は *bold*)
     header_lines = [
         f"*{style['emoji']} Bedrock 日次コスト超過 "
-        f"[Tier {tier}/{tier_count} {style['label']}] ({jst_date.isoformat()})*",
+        f"[Tier {tier}/{tier_count} {style['label']}] ({target_date.isoformat()})*",
         f"ユーザー: *{username}*",
         f"本日コスト: *${total:.2f} USD*  (閾値: ${threshold:.2f})",
     ]
@@ -296,7 +274,7 @@ def format_slack_message(user_row: dict, threshold: float, jst_date: date,
 
     fallback = (
         f"Bedrock 日次コスト超過 [Tier {tier}/{tier_count} {style['label']}] "
-        f"{jst_date.isoformat()}: {username} ${total:.2f} (閾値 ${threshold:.2f})"
+        f"{target_date.isoformat()}: {username} ${total:.2f} (閾値 ${threshold:.2f})"
     )
     return fallback, blocks
 
@@ -321,7 +299,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Bedrock 日次コストアラート")
     parser.add_argument("--config", default="config.yaml", help="YAML 設定ファイル")
     parser.add_argument("--date", default=None,
-                        help="集計対象 JST 日付 (YYYY-MM-DD)。省略時は本日 (JST)")
+                        help="集計対象日付 (YYYY-MM-DD)。省略時は本日")
+    parser.add_argument("--tz", default="Asia/Tokyo",
+                        help="タイムゾーン (既定: Asia/Tokyo, UTC 指定時は AWS 基準の UTC 境界で集計)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Slack 投稿せず stderr に出力。履歴も書き込まない")
     parser.add_argument("--force-notify", action="store_true",
@@ -333,7 +313,9 @@ def main() -> int:
     cfg_path = Path(args.config)
     cfg = load_config(cfg_path)
 
-    jst_d = parse_jst_date(args.date) if args.date else jst_today()
+    tz = parse_tz(args.tz)
+    tz_name = str(tz)
+    target_d = datetime.strptime(args.date, "%Y-%m-%d").date() if args.date else datetime.now(tz).date()
     thresholds = load_thresholds(cfg)
 
     db_path = Path(cfg["db_path"])
@@ -342,12 +324,13 @@ def main() -> int:
 
     tier_desc = ", ".join(f"T{i+1}=${t:.2f}" for i, t in enumerate(thresholds))
     print(f"🗄️  DB: {db_path}", file=sys.stderr)
-    print(f"📅 対象日 (JST): {jst_d}  段階しきい値: {tier_desc}", file=sys.stderr)
+    print(f"📅 対象日 ({tz_name}): {target_d}  段階しきい値: {tier_desc}", file=sys.stderr)
 
     conn = init_db(db_path)
     try:
         if not args.skip_ingest:
-            for (y, m) in months_to_ingest(jst_d):
+            start_utc, end_utc = date_to_utc_range(target_d, tz)
+            for (y, m) in months_to_ingest(start_utc, end_utc):
                 ingest_logs(conn, cfg["bucket"], y, m, cfg["region"])
 
         owner_map = None
@@ -358,9 +341,61 @@ def main() -> int:
             except Exception as e:
                 print(f"⚠️  所有者解決をスキップ: {e}", file=sys.stderr)
 
-        rows = load_daily_stats(conn, jst_d, owner_map)
+        rows = load_daily_stats(conn, target_d, tz, owner_map)
 
-        date_str = jst_d.isoformat()
+        if UNKNOWN_MODELS:
+            unknown_stats: dict[str, dict] = {}
+            for r in rows:
+                for b in r["breakdown"]:
+                    mid = b["model_id"]
+                    if mid not in UNKNOWN_MODELS:
+                        continue
+                    s = unknown_stats.setdefault(mid, {
+                        "calls": 0, "input": 0, "output": 0,
+                        "cache_read": 0, "cache_write_5min": 0, "cache_write_1h": 0,
+                    })
+                    s["calls"] += b["calls"]
+                    s["input"] += b["input"]
+                    s["output"] += b["output"]
+                    s["cache_read"] += b["cache_read"]
+                    s["cache_write_5min"] += b["cache_write_5min"]
+                    s["cache_write_1h"] += b["cache_write_1h"]
+            print("⚠️  未知モデル (料金未定義):", file=sys.stderr)
+            for mid in sorted(unknown_stats):
+                s = unknown_stats[mid]
+                print(
+                    f"   {_short_model(mid)}: "
+                    f"{s['calls']:,} calls, "
+                    f"in={s['input']:,}, out={s['output']:,}, "
+                    f"cache_read={s['cache_read']:,}, "
+                    f"cache_write(5m)={s['cache_write_5min']:,}, "
+                    f"cache_write(1h)={s['cache_write_1h']:,}",
+                    file=sys.stderr,
+                )
+
+        for r in rows:
+            print(
+                f"💰 {r['username']}: ${r['total_usd']:.2f} "
+                f"({r['total_calls']:,} calls, "
+                f"in={r['total_input']:,} tok, out={r['total_output']:,} tok, "
+                f"cache_read={r['total_cache_read']:,} tok, "
+                f"cache_write(5m)={r['total_cache_write_5min']:,} tok, "
+                f"cache_write(1h)={r['total_cache_write_1h']:,} tok)",
+                file=sys.stderr,
+            )
+            for b in r["breakdown"]:
+                print(
+                    f"   {_short_model(b['model_id'])}: "
+                    f"${b['usd']:.4f}  "
+                    f"{b['calls']:,} calls, "
+                    f"in={b['input']:,}, out={b['output']:,}, "
+                    f"cache_read={b['cache_read']:,}, "
+                    f"cache_write(5m)={b['cache_write_5min']:,}, "
+                    f"cache_write(1h)={b['cache_write_1h']:,}",
+                    file=sys.stderr,
+                )
+
+        date_str = target_d.isoformat()
         client = WebClient(token=os.environ["SLACK_BOT_TOKEN"])
         sent = 0
         skipped_dedup = 0
@@ -382,7 +417,7 @@ def main() -> int:
                     continue
 
                 fallback, blocks = format_slack_message(
-                    r, threshold, jst_d, cfg.get("usd_to_jpy"),
+                    r, threshold, target_d, cfg.get("usd_to_jpy"),
                     tier, tier_count,
                 )
 
