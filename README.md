@@ -25,6 +25,35 @@ S3 に出力された AWS Bedrock の Model Invocation Logs を集計し、**JST
 - Bedrock の Invocation Logging が有効化され、S3 にログが出力されていること
 - Slack Bot トークン（`chat:write` スコープ、通知先チャンネルへの招待済み）
 
+### AWS 認証情報の設定
+
+本ツールは `boto3` 経由で AWS API を呼び出す。boto3 は以下の順で認証情報を探す。
+
+1. 環境変数 `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`
+2. AWS CLI の設定ファイル `~/.aws/credentials` / `~/.aws/config`
+3. IAM ロール（EC2 / ECS / Lambda などのインスタンスプロファイル）
+
+cron での運用時は環境変数が引き継がれないことが多いため、`aws configure` でプロファイルを作成しておくのが確実。
+
+```bash
+# 初回設定
+aws configure
+# → Access Key ID / Secret Access Key / Region / Output format を入力
+```
+
+複数プロファイルを切り替える場合は `AWS_PROFILE` 環境変数を指定する:
+
+```bash
+AWS_PROFILE=my-profile ./run_daily_alert.sh --dry-run
+```
+
+必要な IAM 権限:
+
+| API | 用途 |
+| --- | --- |
+| `s3:ListBucket` / `s3:GetObject` | Bedrock Invocation Logs の取得 |
+| `iam:ListUsers` / `iam:ListUserTags` | IAM タグによる所有者解決（`resolve_owner: true` 時のみ） |
+
 ### モデル呼び出しログ記録の設定 (参考)
 
 #### 1. S3 ストレージの設定
@@ -153,7 +182,8 @@ export SLACK_BOT_TOKEN="xoxb-XXXXXXXXXXXX-XXXXXXXXXXXX-XXXXXXXXXXXXXXXXXXXXXXXX"
 | フラグ | 説明 |
 | --- | --- |
 | `--config <path>` | YAML 設定ファイル（デフォルト `config.yaml`） |
-| `--date YYYY-MM-DD` | 集計対象 JST 日付。省略時は本日 (JST) |
+| `--date YYYY-MM-DD` | 集計対象日付。省略時は `--tz` で指定したタイムゾーンの本日 |
+| `--tz <tz>` | タイムゾーン（既定: `Asia/Tokyo`）。`UTC` を指定すると AWS 基準の UTC 境界で集計 |
 | `--dry-run` | Slack 投稿せず stderr に出力。通知履歴も書き込まない |
 | `--force-notify` | 通知履歴を無視して再投稿 |
 | `--skip-ingest` | S3 取り込みをスキップし DB 内容のみで判定 |
@@ -218,7 +248,7 @@ python bedrock_cost_report.py \
 
 ## 注意事項
 
-- 出力されるコストは公開単価からの**推計値**であり、実際の AWS 請求額とは一致しない場合がある（経験的に全カテゴリ一律 15〜17% トークンが不足する傾向あり）。
+- 出力されるコストは公開単価からの**推計値**であり、実際の AWS 請求額とは一致しない場合がある。
 - 正確な請求額は AWS Cost Explorer の usage type 別内訳を参照すること。
 - 本ツールは「ユーザー別・モデル別の利用比率」を把握する用途に適している。
 - ペイロード本体ファイル (`_input.json.gz` / `_output.json.gz`) は集計対象から除外している。
